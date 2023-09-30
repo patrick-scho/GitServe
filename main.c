@@ -31,13 +31,45 @@ static int gitDiffPrintCb(const git_diff_delta *delta, const git_diff_hunk *hunk
       int *html_len;
     } *userdata = payload;
   //printf("hunk: %s\n", hunk->header);
-  #define HTML(...) *userdata->html_len += snprintf(userdata->html + *userdata->html_len, HTML_SIZE - *userdata->html_len, __VA_ARGS__)
 
-  if (line->origin == '+') HTML("<span style=\"color: green;\">%c %*d %.*s</span>", line->origin, 6, line->new_lineno, line->content_len, line->content);
-  if (line->origin == '-') HTML("<span style=\"color: red;\">%c %*d %.*s</span>", line->origin, 6, line->old_lineno, line->content_len, line->content);
-  if (line->origin == 'H') HTML("<span>%.*s</span>", line->content_len, line->content);
+  if (line->origin == '+' || line->origin == '-' || line->origin == 'H') {
 
-  #undef HTML
+    #define HTML(...) *userdata->html_len += snprintf(userdata->html + *userdata->html_len, HTML_SIZE - *userdata->html_len, __VA_ARGS__)
+
+    /**/ if (line->origin == '+') HTML("<span style=\"color: green;\">%c %*d", line->origin, 6, line->new_lineno);
+    else if (line->origin == '-') HTML("<span style=\"color: red;\">%c %*d", line->origin, 6, line->old_lineno);
+    else if (line->origin == 'H') HTML("<span>");
+    //else                          HTML("<span>%c ", line->origin);
+
+    struct { char c; const char * replacement; }
+    replacements[] = {
+      { '<', "&lt;" },
+      { '>', "&gt;" },
+      { '&', "&amp;" },
+    };
+
+    for (int i = 0; i < line->content_len; i++) {
+      char c = ((char*)line->content)[i];
+      bool replaced = false;
+      for (int j = 0; j < sizeof(replacements)/sizeof(replacements[0]); i++) {
+        if (replacements[j].c == c) {
+          size_t len = strlen(replacements[j].replacement);
+          memcpy(userdata->html + *userdata->html_len, replacements[j].replacement, len);
+          (*userdata->html_len) += len;
+
+          replaced = true;
+          break;
+        }
+      }
+      if (! replaced)
+        userdata->html[(*userdata->html_len)++] = c;
+    }
+
+    HTML("</span>");
+  
+    #undef HTML
+
+  }
 
   return 0;
 }
@@ -310,10 +342,36 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
 
         if (! isBinary) {
           HTML("<pre style=\"height: calc(70%% - 46px); margin: 10px;\">"
-            "<textarea readonly style=\"width: 100%%; height: 100%%; font-family: monospace;\">"
-            "%.*s"
-            "</textarea></pre>\n",
-            (int)rawsize, rawcontent);
+               "<div readonly class=\"diff\">");
+
+          struct { char c; const char *replacement; }
+          replacements[] = {
+              {'<', "&lt;"},
+              {'>', "&gt;"},
+              {'&', "&amp;"},
+          };
+
+          for (int i = 0; i < rawsize; i++)
+          {
+            char c = ((char *)rawcontent)[i];
+            bool replaced = false;
+            for (int j = 0; j < sizeof(replacements) / sizeof(replacements[0]); i++)
+            {
+              if (replacements[j].c == c)
+              {
+                size_t len = strlen(replacements[j].replacement);
+                memcpy(userdata->html + *userdata->html_len, replacements[j].replacement, len);
+                (*userdata->html_len) += len;
+
+                replaced = true;
+                break;
+              }
+            }
+            if (!replaced)
+              userdata->html[(*userdata->html_len)++] = c;
+          }
+          }
+          HTML("</div></pre>\n");
         }
         else {
           HTML("<pre>Binary file :[</pre>\n");
