@@ -25,6 +25,22 @@ static void serve_html(struct mg_connection *c, struct mg_http_message *hm, cons
   struct mg_http_serve_opts opts = { .mime_types = "html=text/html" };
   mg_http_serve_file(c, hm, filename, &opts);
 }
+static int gitDiffPrintCb(const git_diff_delta *delta, const git_diff_hunk *hunk, const git_diff_line *line, void *payload) {
+  struct {
+      char *html;
+      int *html_len;
+    } *userdata = payload;
+  //printf("hunk: %s\n", hunk->header);
+  #define HTML(...) *userdata->html_len += snprintf(userdata->html + *userdata->html_len, HTML_SIZE - *userdata->html_len, __VA_ARGS__)
+
+  if (line->origin == '+') HTML("<span style=\"color: green;\">%c %*d %.*s</span>", line->origin, 6, line->new_lineno, line->content_len, line->content);
+  if (line->origin == '-') HTML("<span style=\"color: red;\">%c %*d %.*s</span>", line->origin, 6, line->old_lineno, line->content_len, line->content);
+  if (line->origin == 'H') HTML("<span>%.*s</span>", line->content_len, line->content);
+
+  #undef HTML
+
+  return 0;
+}
 static void serve_pdf(struct mg_connection *c, struct mg_http_message *hm, const char *filename) {
   struct mg_http_serve_opts opts =
     { .mime_types = "pdf=application/pdf",
@@ -57,9 +73,6 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
     }
   }
 
-  // 0123456
-  // abc/def
-
   // if type is file, split path and file
   file.ptr = NULL; file.len = 0;
   if (mg_strcmp(type, mg_str("tree")) != 0) {
@@ -79,24 +92,6 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
     }
   }
 
-  // printf(
-  //   "repo: %.*s\n"
-  //   "branch: %.*s\n"
-  //   "commit: %.*s\n"
-  //   "type: %.*s\n"
-  //   "path: %.*s\n"
-  //   "file: %.*s\n"
-  //   "path+file: %.*s" "%s" "%.*s\n",
-  //   repo.len, repo.ptr,
-  //   branch.len, branch.ptr,
-  //   commit.len, commit.ptr,
-  //   type.len, type.ptr,
-  //   path.len, path.ptr,
-  //   file.len, file.ptr,
-  //   path.len, path.ptr,
-  //   (path.len > 0 && file.len > 0) ? "/" : "",
-  //   file.len, file.ptr);
-  // return;
 
   // init libgit2
 	git_libgit2_init();
@@ -105,19 +100,41 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
   int html_len = 0;
   #define HTML(...) html_len += snprintf(html+html_len,HTML_SIZE-html_len, __VA_ARGS__)
 
+  static char repoStr[128]; snprintf(repoStr, 128, "%s/%.*s", repo_prefix, repo.len, repo.ptr);
+  static char branchStr[128]; snprintf(branchStr, 128, "%.*s", branch.len, branch.ptr);
+  static char commitStr[128]; snprintf(commitStr, 128, "%.*s", commit.len, commit.ptr);
+  static char pathStr[128]; snprintf(pathStr, 128, "%.*s", path.len, path.ptr);
+
 	git_repository * gitrepo = NULL;
-	git_index * index = NULL;
-
-	int error;
-
-  static char repoStr[128];
-  snprintf(repoStr, 128, "%s/%.*s", repo_prefix, repo.len, repo.ptr);
-	error = git_repository_open_bare(&gitrepo, repoStr);
-  if (error)
-    printf("error trying to open repo [%s]: (%d)%s\n", repoStr, error, git_error_last()->message);
+	git_repository_open_bare(&gitrepo, repoStr);
 
 	git_revwalk *walk;
 	git_revwalk_new(&walk, gitrepo);
+
+  git_annotated_commit *annotated_commit;
+  {
+  git_reference *ref;
+  git_branch_lookup(&ref, gitrepo, branchStr, GIT_BRANCH_LOCAL);
+  git_annotated_commit_from_ref(&annotated_commit, gitrepo, ref);
+  }
+
+  git_commit *gitcommit;
+  git_commit *gitcommitPrev = NULL;
+  git_revparse_single((git_object**)&gitcommit, gitrepo, commitStr);
+  if (gitcommit == NULL)
+    git_commit_lookup(&gitcommit, gitrepo, git_annotated_commit_id(annotated_commit));
+  
+  git_tree * commitTree;
+  git_tree * subtree;
+  git_commit_tree(&commitTree, gitcommit);
+  if (path.len == 0) {
+    subtree = commitTree;
+  }
+  else {
+    const git_tree_entry * pathEntry = git_tree_entry_byname(commitTree, pathStr);
+    git_tree_lookup(&subtree, gitrepo, git_tree_entry_id(pathEntry));
+  }
+
 
   HTML(
     "<html>\n"
@@ -127,13 +144,11 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
     "div.mainlink { font-family: monospace; font-size: 24pt; }"
     "div.box { border: 1px solid rgb(118,118,118); margin: 10px; overflow: hidden; position: relative; }"
     "div.subbox { margin: 0; width; 100%%; height: 100%%; float: left; }"
+    "div.diff { border: 1px solid rgb(118, 118, 118); width: 100%%; height: 100%%; font-family: monospace; overflow-y: scroll; }"
     "</style>\n"
-    // "<link rel=\"stylesheet\" href=\"//cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/default.min.css\">\n"
     "</head>\n"
     "<body>\n"
-    // "<script src=\"//cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js\"></script>\n"
-    // "<script>hljs.highlightAll();</script>\n"
-    );
+  );
 
 	// Loop over branches
 
@@ -154,7 +169,7 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
       
       // get first commit
       git_annotated_commit *annotated_commit = NULL;
-      error = git_annotated_commit_from_ref(&annotated_commit, gitrepo, ref);
+      git_annotated_commit_from_ref(&annotated_commit, gitrepo, ref);
       // git_commit *commit;
       // git_commit_lookup(&commit, gitrepo, git_annotated_commit_id(annotated_commit));
 
@@ -170,41 +185,32 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
   HTML("</div>\n");
     
   // Loop over commits
-  
-  git_commit *gitcommit;
-  static char commitStr[128]; snprintf(commitStr, 128, "%.*s", commit.len, commit.ptr);
-  // git_commit_lookup(&gitcommit, gitrepo, &oid);
-  git_revparse_single((git_object**)&gitcommit, gitrepo, commitStr);
-
 
   HTML("<div class=\"subbox\" style=\"width: 70%%; overflow-y: scroll;\">\n");
 
-  static char branchStr[128];
-  snprintf(branchStr, 128, "%.*s", branch.len, branch.ptr);
-  
-  git_reference *ref;
-  git_branch_lookup(&ref, gitrepo, branchStr, GIT_BRANCH_LOCAL);
-  // make first commit from branch
-  git_annotated_commit *annotated_commit = NULL;
-  error = git_annotated_commit_from_ref(&annotated_commit, gitrepo, ref);
-
-  if (gitcommit == NULL)
-    git_commit_lookup(&gitcommit, gitrepo, git_annotated_commit_id(annotated_commit));
-
-  // walk commits starting from the retreived commit
   git_revwalk_reset(walk);
   git_revwalk_push(walk, git_annotated_commit_id(annotated_commit));
-  // static char glob[128]; snprintf(glob, 128, "%s", git_oid_tostr_s(git_annotated_commit_id(annotated_commit)));
-  // printf("glob: %s\n", glob);
-  // git_revwalk_push_glob(walk, glob);
+  
   git_oid oid;
+  bool currentCommitFound = false;
   while (GIT_ITEROVER != git_revwalk_next(&oid, walk))
   {
     // get commit message
     git_commit *curCommit;
     git_commit_lookup(&curCommit, gitrepo, &oid);
 
-    HTML("<a href=\"/git/%.*s/%.*s/%.*s/%.*s%s%.*s%s%.*s\">[%.*s] %s%s</a><br />\n",
+    // check found first, from last loop iteration
+    if (currentCommitFound) {
+      gitcommitPrev = curCommit;
+      currentCommitFound = false;
+    }
+
+    // set here for this iteration for HTML, and for next for setting gitcommitPrev :)
+    if (git_oid_equal(git_commit_id(gitcommit), git_commit_id(curCommit))) {
+      currentCommitFound = true;
+    }
+
+    HTML("<a href=\"/git/%.*s/%.*s/%.*s/%.*s%s%.*s%s%.*s\">[%.*s] %s%s</a>",
       repo.len, repo.ptr,
       branch.len, branch.ptr,
       OID_SIZE, git_oid_tostr_s(git_commit_id(curCommit)),
@@ -214,15 +220,19 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
       file.len > 0 ? "/" : "",
       file.len, file.ptr,
       OID_SIZE, git_oid_tostr_s(git_commit_id(curCommit)),
-      // (mg_vcmp(&commit, git_oid_tostr_s(git_commit_id(curCommit))) == 0) ? "> " : "",
-      git_oid_equal(git_commit_id(gitcommit), git_commit_id(curCommit)) ? "> " : "",
+      currentCommitFound ? "> " : "",
       git_commit_message(curCommit));
+    
+    HTML(" (<a href=\"/git/%.*s/%.*s/%.*s/diff\">diff</a>)<br />\n",
+      repo.len, repo.ptr,
+      branch.len, branch.ptr,
+      OID_SIZE, git_oid_tostr_s(git_commit_id(curCommit)));
   }
   
   HTML("</div>\n");
 
   HTML("</div>\n");
-
+  
   // tree
 
   HTML("<div class=\"box\" style=\"height: 20%%; overflow-y: scroll;\">\n");
@@ -246,35 +256,6 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
       lastSlash);
   }
 
-  // TODO: diff
-  // static char diffNames[64][64];
-  // int numDiffNames = 0;
-  // snprintf(cmd, 1024, "git -C %s/%.*s diff-tree %.*s --name-only -r | tail -n +2",
-  //   repo_prefix, repo.len, repo.ptr,
-  //   commit.len, commit.ptr);
-  // f = popen(cmd, "r");
-
-  // while (fscanf(f, "%63[^\n]\n", diffNames[numDiffNames]) == 1) {
-  //   numDiffNames++;
-  // }
-  // pclose(f);
-  
-  
-  git_tree * commitTree = NULL;
-  git_tree * subtree = NULL;
-
-  git_oid_fromstrn(&oid, commit.ptr, commit.len);
-  
-  git_commit_tree(&commitTree, gitcommit);
-
-  if (path.len == 0) {
-    subtree = commitTree;
-  }
-  else {
-    static char pathStr[128]; snprintf(pathStr, 128, "%.*s", path.len, path.ptr);
-    const git_tree_entry * pathEntry = git_tree_entry_byname(commitTree, pathStr);
-    git_tree_lookup(&subtree, gitrepo, git_tree_entry_id(pathEntry));
-  }
   size_t count = git_tree_entrycount(subtree);
 
   for (int i = 0; i < count; i++)
@@ -303,25 +284,7 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
       git_tree_entry_type(entry) == GIT_OBJECT_TREE ? "&#x1F4C1" : "&#x1F4C4",
       (mg_vcmp(&file, nameStr) == 0) ? "> " : "",
       nameStr);
-      // TOOO: diff
-      //   for (int i = 0; i < numDiffNames; i++) {
-      //     static char fullName[128];
-      //     snprintf(fullName, 128, "%.*s%s%s",
-      //       path.len, path.ptr,
-      //       path.len > 0 ? "/" : "",
-      //       nameStr);
-      //     if (strcmp(diffNames[i], fullName) == 0) {
-      //       HTML(" <a href=\"/git/%.*s/%.*s/%.*s/diff%s%.*s%s%s\">diff</a>",
-      //         repo.len, repo.ptr,
-      //         branch.len, branch.ptr,
-      //         commit.len, commit.ptr,
-      //         path.len > 0 ? "/" : "",
-      //         path.len, path.ptr,
-      //         strlen(nameStr) > 0 ? "/" : "",
-      //         nameStr);
-      //       break;
-      //     }
-      //   }
+    
     
     HTML("<br />\n");
   }
@@ -330,18 +293,13 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
   
   // blob
 
-  if (mg_strcmp(type, mg_str("tree")) != 0)
+  if (mg_strcmp(type, mg_str("blob")) == 0)
   {
-    // TODO: diff
-
     static char fileStr[128]; snprintf(fileStr, 128, "%.*s", file.len, file.ptr);
     const git_tree_entry * entry = git_tree_entry_byname(subtree, fileStr);
 
     if (git_tree_entry_type(entry) == GIT_OBJECT_BLOB) {
       git_blob *blob;
-      // int res =
-      //   git_blob_lookup(&blob, gitrepo,
-      //     git_tree_entry_id(entry));
       int res =
         git_tree_entry_to_object((git_object**)&blob, gitrepo, entry);
 
@@ -351,12 +309,10 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
         bool isBinary = git_blob_is_binary(blob);
 
         if (! isBinary) {
-          // HTML("<pre><code class=\"language-c\">%.*s</code></pre>\n",
-          HTML(            "<pre style=\"height: calc(70%% - 46px); margin: 10px;\">"
+          HTML("<pre style=\"height: calc(70%% - 46px); margin: 10px;\">"
             "<textarea readonly style=\"width: 100%%; height: 100%%; font-family: monospace;\">"
             "%.*s"
             "</textarea></pre>\n",
-          // HTML("<pre>%.*s</pre>\n",
             (int)rawsize, rawcontent);
         }
         else {
@@ -379,35 +335,58 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
           case GIT_OBJECT_REF_DELTA: HTML("<pre> Error loading GIT_OBJECT_REF_DELTA! >:( </pre>\n"); break;
       }
     }
+  }
+  else if (mg_strcmp(type, mg_str("diff")) == 0) {
+    if (gitcommitPrev != NULL) {
+      git_diff * diff;
+      git_tree * commitTreePrev;
+      git_tree * subtreePrev;
+      git_commit_tree(&commitTreePrev, gitcommitPrev);
+      if (path.len == 0) {
+        subtreePrev = commitTreePrev;
+      }
+      else {
+        const git_tree_entry * pathEntry = git_tree_entry_byname(commitTreePrev, pathStr);
+        git_tree_lookup(&subtreePrev, gitrepo, git_tree_entry_id(pathEntry));
+      }
 
-    // HTML("<pre>");
-    // int c;
-    // bool found = false;
-    // bool newline = true;
-    // int line = 1;
-    // while ((c = fgetc(f)) != EOF) {
-    //   found = true;
-    //   if (newline) {
-    //     HTML("%.*s%d   ", 4-(int)log10(line), "              ", line++);
-    //     newline = false;
-    //   }
+      git_diff_tree_to_tree(&diff, gitrepo, subtreePrev, subtree, NULL);
+      struct {
+        char *html;
+        int *html_len;
+      } userdata;
+      userdata.html = html;
+      userdata.html_len = &html_len;
 
-    //   if (c == '<')
-    //     HTML("&lt;");
-    //   else if (c == '>')
-    //     HTML("&gt;");
-    //   else
-    //     HTML("%c", c);
+      HTML("<pre style=\"height: calc(70%% - 46px); margin: 10px;\">"
+           "<div readonly class=\"diff\">");
       
-    //   if (c == '\n')
-    //     newline = true;
-    // }
-    // if (! found)
-    //   HTML("File not found :(");
-    // HTML("</pre><\n");
+      git_diff_print(diff, GIT_DIFF_FORMAT_PATCH, gitDiffPrintCb, &userdata);
+      
+      HTML("</div></pre>\n");
+    }
+    else {
+      git_diff * diff;
+      git_diff_tree_to_tree(&diff, gitrepo, NULL, subtree, NULL);
+      struct {
+        char *html;
+        int *html_len;
+      } userdata;
+      userdata.html = html;
+      userdata.html_len = &html_len;
+
+      HTML("<pre style=\"height: calc(70%% - 46px); margin: 10px;\">"
+           "<div readonly class=\"diff\">");
+      
+      git_diff_print(diff, GIT_DIFF_FORMAT_PATCH, gitDiffPrintCb, &userdata);
+      
+      HTML("</div></pre>\n");
+    }
   }
   
   HTML("</body>\n</html>");
+
+  #undef HTML
 
   mg_http_reply(c, 200, NULL, "%s", html);
 }
