@@ -51,7 +51,7 @@ static int gitDiffPrintCb(const git_diff_delta *delta, const git_diff_hunk *hunk
     for (int i = 0; i < line->content_len; i++) {
       char c = ((char*)line->content)[i];
       bool replaced = false;
-      for (int j = 0; j < sizeof(replacements)/sizeof(replacements[0]); i++) {
+      for (int j = 0; j < sizeof(replacements)/sizeof(replacements[0]); j++) {
         if (replacements[j].c == c) {
           size_t len = strlen(replacements[j].replacement);
           memcpy(userdata->html + *userdata->html_len, replacements[j].replacement, len);
@@ -355,21 +355,20 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
           {
             char c = ((char *)rawcontent)[i];
             bool replaced = false;
-            for (int j = 0; j < sizeof(replacements) / sizeof(replacements[0]); i++)
+            for (int j = 0; j < sizeof(replacements) / sizeof(replacements[0]); j++)
             {
               if (replacements[j].c == c)
               {
                 size_t len = strlen(replacements[j].replacement);
-                memcpy(userdata->html + *userdata->html_len, replacements[j].replacement, len);
-                (*userdata->html_len) += len;
+                memcpy(html + html_len, replacements[j].replacement, len);
+                html_len += len;
 
                 replaced = true;
                 break;
               }
             }
             if (!replaced)
-              userdata->html[(*userdata->html_len)++] = c;
-          }
+              html[html_len++] = c;
           }
           HTML("</div></pre>\n");
         }
