@@ -5,9 +5,12 @@
 #include <mongoose.h>
 
 
+#define MIN(a,b) (a<b?a:b)
+#define MAX(a,b) (a>b?a:b)
 
 #define HTML_SIZE (8*1024*1024)
 #define OID_SIZE (8)
+#define COMMITS_PER_PAGE (10)
 
 
 
@@ -36,8 +39,8 @@ static int gitDiffPrintCb(const git_diff_delta *delta, const git_diff_hunk *hunk
 
     #define HTML(...) *userdata->html_len += snprintf(userdata->html + *userdata->html_len, HTML_SIZE - *userdata->html_len, __VA_ARGS__)
 
-    /**/ if (line->origin == '+') HTML("<span style=\"color: green;\">%c %*d", line->origin, 6, line->new_lineno);
-    else if (line->origin == '-') HTML("<span style=\"color: red;\">%c %*d", line->origin, 6, line->old_lineno);
+    /**/ if (line->origin == '+') HTML("<span style=\"color: green;\">%c %*d ", line->origin, 6, line->new_lineno);
+    else if (line->origin == '-') HTML("<span style=\"color: red;\">%c %*d ", line->origin, 6, line->old_lineno);
     else if (line->origin == 'H') HTML("<span>");
     //else                          HTML("<span>%c ", line->origin);
 
@@ -96,6 +99,8 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
   int state = 0;
   for (int i = 4; i < hm->uri.len; i++) {
     char c = hm->uri.ptr[i];
+    if (c == '?')
+      break;
     if (c == '/' && state <= caps_len-1) {
       caps[state]->ptr = &hm->uri.ptr[i + 1];
       state++;
@@ -218,15 +223,48 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
     
   // Loop over commits
 
+  unsigned int page = 0;
+  {
+  struct mg_str pageStr = mg_http_var(hm->query, mg_str("page"));
+  for (int i = 0; i < pageStr.len; i++) {
+    page *= 10;
+    page += pageStr.ptr[i] - '0';
+  }
+  }
+  if (page == 0) {
+    git_revwalk_reset(walk);
+    git_revwalk_push(walk, git_annotated_commit_id(annotated_commit));
+    git_oid oid;
+    int i = 0;
+    while (GIT_ITEROVER != git_revwalk_next(&oid, walk)) {
+      if (git_oid_equal(git_commit_id(gitcommit), &oid)) {
+        page = i / COMMITS_PER_PAGE + 1;
+        break;
+      }
+      i++;
+    }
+  }
+
   HTML("<div class=\"subbox\" style=\"width: 70%%; overflow-y: scroll;\">\n");
 
   git_revwalk_reset(walk);
   git_revwalk_push(walk, git_annotated_commit_id(annotated_commit));
   
+  unsigned int curPage = 1;
+  unsigned int commitCounter = 0;
+  unsigned int commitTotalCount = 0;
+
   git_oid oid;
   bool currentCommitFound = false;
   while (GIT_ITEROVER != git_revwalk_next(&oid, walk))
   {
+    if (commitCounter >= COMMITS_PER_PAGE) {
+      commitCounter = 0;
+      curPage++;
+    }
+    commitCounter++;
+    commitTotalCount++;
+
     // get commit message
     git_commit *curCommit;
     git_commit_lookup(&curCommit, gitrepo, &oid);
@@ -242,24 +280,33 @@ static void serve_git(struct mg_connection *c, struct mg_http_message *hm,
       currentCommitFound = true;
     }
 
-    HTML("<a href=\"/git/%.*s/%.*s/%.*s/%.*s%s%.*s%s%.*s\">[%.*s] %s%s</a>",
-      repo.len, repo.ptr,
-      branch.len, branch.ptr,
-      OID_SIZE, git_oid_tostr_s(git_commit_id(curCommit)),
-      type.len, type.ptr,
-      path.len > 0 ? "/" : "",
-      path.len, path.ptr,
-      file.len > 0 ? "/" : "",
-      file.len, file.ptr,
-      OID_SIZE, git_oid_tostr_s(git_commit_id(curCommit)),
-      currentCommitFound ? "> " : "",
-      git_commit_message(curCommit));
-    
-    HTML(" (<a href=\"/git/%.*s/%.*s/%.*s/diff\">diff</a>)<br />\n",
-      repo.len, repo.ptr,
-      branch.len, branch.ptr,
-      OID_SIZE, git_oid_tostr_s(git_commit_id(curCommit)));
+    if (page == curPage) {
+      HTML("<a href=\"/git/%.*s/%.*s/%.*s/%.*s%s%.*s%s%.*s\">[%.*s] %s%s</a>",
+        repo.len, repo.ptr,
+        branch.len, branch.ptr,
+        OID_SIZE, git_oid_tostr_s(git_commit_id(curCommit)),
+        type.len, type.ptr,
+        path.len > 0 ? "/" : "",
+        path.len, path.ptr,
+        file.len > 0 ? "/" : "",
+        file.len, file.ptr,
+        OID_SIZE, git_oid_tostr_s(git_commit_id(curCommit)),
+        currentCommitFound ? "> " : "",
+        git_commit_message(curCommit));
+      
+      HTML(" (<a href=\"/git/%.*s/%.*s/%.*s/diff\">diff</a>)<br />\n",
+        repo.len, repo.ptr,
+        branch.len, branch.ptr,
+        OID_SIZE, git_oid_tostr_s(git_commit_id(curCommit)));
+    }
   }
+  int commitFrom = (page-1)*COMMITS_PER_PAGE+1;
+  int commitTo = MIN((page-1)*COMMITS_PER_PAGE+COMMITS_PER_PAGE, commitTotalCount);
+
+  HTML("<span style=\"white-space: nowrap; overflow-x: hidden; position: absolute; right: 30px; bottom: 0px;\"><form method=\"GET\" style=\"display: inline-block;\"><input type=\"hidden\" name=\"page\" value=\"%d\" /><input type=\"submit\" %s value=\"<\" /></form>", page-1, page > 1 ? "" : "disabled");
+  HTML("<form method=\"GET\" style=\"display: inline-block;\"><input type=\"hidden\" name=\"page\" value=\"%d\" /><input type=\"submit\" %s value=\">\" /></form>", page+1, page < curPage ? "" : "disabled");
+  // HTML("<div style=\"display: inline-block;\"> Page %d/%d <br /> Commits %d-%d out of %d</div></span>", page, curPage, commitFrom, commitTo, commitTotalCount);
+  HTML("<div style=\"display: inline-block;\"> Page %d/%d</div></span>", page, curPage);
   
   HTML("</div>\n");
 
